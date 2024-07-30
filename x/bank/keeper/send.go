@@ -28,6 +28,7 @@ type SendKeeper interface {
 
 	InputOutputCoins(ctx context.Context, input types.Input, outputs []types.Output) error
 	SendCoins(ctx context.Context, fromAddr, toAddr sdk.AccAddress, amt sdk.Coins) error
+	SendManyCoins(ctx context.Context, fromAddr sdk.AccAddress, toAddrs []sdk.AccAddress, amts []sdk.Coins) error
 
 	GetParams(ctx context.Context) types.Params
 	SetParams(ctx context.Context, params types.Params) error
@@ -60,6 +61,7 @@ type BaseSendKeeper struct {
 	ak           types.AccountKeeper
 	storeService store.KVStoreService
 	logger       log.Logger
+	hooks        types.BankHooks
 
 	// list of addresses that are restricted from receiving transactions
 	blockedAddrs map[string]bool
@@ -113,6 +115,17 @@ func (k BaseSendKeeper) ClearSendRestriction() {
 // GetAuthority returns the x/bank module's authority.
 func (k BaseSendKeeper) GetAuthority() string {
 	return k.authority
+}
+
+// Set the bank hooks
+func (k *BaseSendKeeper) SetHooks(bh types.BankHooks) *BaseSendKeeper {
+	if k.hooks != nil {
+		panic("cannot set bank hooks twice")
+	}
+
+	k.hooks = bh
+
+	return k
 }
 
 // GetParams returns the total set of bank parameters.
@@ -203,11 +216,29 @@ func (k BaseSendKeeper) InputOutputCoins(ctx context.Context, input types.Input,
 	return nil
 }
 
+// SendCoinsWithoutBlockHook calls sendCoins without calling the `BlockBeforeSend` hook.
+func (k BaseSendKeeper) SendCoinsWithoutBlockHook(ctx context.Context, fromAddr, toAddr sdk.AccAddress, amt sdk.Coins) error {
+	return k.sendCoins(ctx, fromAddr, toAddr, amt)
+}
+
 // SendCoins transfers amt coins from a sending account to a receiving account.
 // An error is returned upon failure.
 func (k BaseSendKeeper) SendCoins(ctx context.Context, fromAddr, toAddr sdk.AccAddress, amt sdk.Coins) error {
-	var err error
-	err = k.subUnlockedCoins(ctx, fromAddr, amt)
+	// BlockBeforeSend hook should always be called before the TrackBeforeSend hook.
+	err := k.BlockBeforeSend(ctx, fromAddr, toAddr, amt)
+	if err != nil {
+		return err
+	}
+
+	return k.sendCoins(ctx, fromAddr, toAddr, amt)
+}
+
+// sendCoins has the internal logic for sending coins.
+func (k BaseSendKeeper) sendCoins(ctx context.Context, fromAddr, toAddr sdk.AccAddress, amt sdk.Coins) error {
+	// call the TrackBeforeSend hooks
+	k.TrackBeforeSend(ctx, fromAddr, toAddr, amt)
+
+	err := k.subUnlockedCoins(ctx, fromAddr, amt)
 	if err != nil {
 		return err
 	}
@@ -247,6 +278,65 @@ func (k BaseSendKeeper) SendCoins(ctx context.Context, fromAddr, toAddr sdk.AccA
 			sdk.NewAttribute(types.AttributeKeySender, fromAddrString),
 		),
 	})
+
+	return nil
+}
+
+// SendManyCoins transfer multiple amt coins from a sending account to multiple receiving accounts.
+// An error is returned upon failure.
+func (k BaseSendKeeper) SendManyCoins(ctx context.Context, fromAddr sdk.AccAddress, toAddrs []sdk.AccAddress, amts []sdk.Coins) error {
+	if len(toAddrs) != len(amts) {
+		return fmt.Errorf("addresses and amounts numbers does not match")
+	}
+
+	totalAmt := sdk.Coins{}
+	for i, amt := range amts {
+		// make sure to trigger the BeforeSend hooks for all the sends that are about to occur
+		k.TrackBeforeSend(ctx, fromAddr, toAddrs[i], amts[i])
+
+		err := k.BlockBeforeSend(ctx, fromAddr, toAddrs[i], amts[i])
+		if err != nil {
+			return err
+		}
+
+		totalAmt = sdk.Coins.Add(totalAmt, amt...)
+	}
+
+	err := k.subUnlockedCoins(ctx, fromAddr, totalAmt)
+	if err != nil {
+		return err
+	}
+
+	fromAddrString := fromAddr.String()
+	sdkCtx := sdk.UnwrapSDKContext(ctx)
+	for i, toAddr := range toAddrs {
+		amt := amts[i]
+
+		err := k.addCoinsImproved(ctx, toAddr, amt)
+		if err != nil {
+			return err
+		}
+
+		// Not needed for epoch code, every user must have an account
+		// acc := k.ak.GetAccount(ctx, toAddr)
+		// if acc == nil {
+		// 	defer telemetry.IncrCounter(1, "new", "account")
+		// 	k.ak.SetAccount(ctx, k.ak.NewAccountWithAddress(ctx, toAddr))
+		// }
+
+		sdkCtx.EventManager().EmitEvents(sdk.Events{
+			sdk.NewEvent(
+				types.EventTypeTransfer,
+				sdk.NewAttribute(types.AttributeKeyRecipient, toAddr.String()),
+				sdk.NewAttribute(types.AttributeKeySender, fromAddrString),
+				sdk.NewAttribute(sdk.AttributeKeyAmount, amt.String()),
+			),
+		})
+	}
+	sdkCtx.EventManager().EmitEvent(sdk.NewEvent(
+		sdk.EventTypeMessage,
+		sdk.NewAttribute(types.AttributeKeySender, fromAddr.String()),
+	))
 
 	return nil
 }
@@ -293,6 +383,27 @@ func (k BaseSendKeeper) subUnlockedCoins(ctx context.Context, addr sdk.AccAddres
 	sdkCtx.EventManager().EmitEvent(
 		types.NewCoinSpentEvent(addr, amt),
 	)
+
+	return nil
+}
+
+// Better add coins implementation for code that is not gas metered. Reduces I/O overhead.
+// Used in osmosis epoch.
+// Also removes event that should not exist.
+func (k BaseSendKeeper) addCoinsImproved(ctx context.Context, addr sdk.AccAddress, amt sdk.Coins) error {
+	if !amt.IsValid() {
+		return errorsmod.Wrap(sdkerrors.ErrInvalidCoins, amt.String())
+	}
+
+	for _, coin := range amt {
+		balance := k.GetBalance(ctx, addr, coin.Denom)
+		newBalance := balance.Add(coin)
+
+		err := k.setBalance(ctx, addr, newBalance)
+		if err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
