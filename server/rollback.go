@@ -1,9 +1,9 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 
-	cmtcmd "github.com/cometbft/cometbft/cmd/cometbft/commands"
 	"github.com/spf13/cobra"
 
 	"github.com/cosmos/cosmos-sdk/client/flags"
@@ -12,8 +12,10 @@ import (
 
 // NewRollbackCmd creates a command to rollback CometBFT and multistore state by one height.
 func NewRollbackCmd(appCreator types.AppCreator, defaultNodeHome string) *cobra.Command {
-	var removeBlock bool
-
+	var (
+		removeBlock bool
+		height      int64
+	)
 	cmd := &cobra.Command{
 		Use:   "rollback",
 		Short: "rollback Cosmos SDK and CometBFT state by one height",
@@ -35,22 +37,26 @@ application.
 			}
 			app := appCreator(ctx.Logger, db, nil, ctx.Viper)
 			// rollback CometBFT state
-			height, hash, err := cmtcmd.RollbackState(ctx.Config, removeBlock)
-			if err != nil {
-				return fmt.Errorf("failed to rollback CometBFT state: %w", err)
-			}
+			// height, hash, err := cmtcmd.RollbackState(ctx.Config, removeBlock)
+			// if err != nil {
+			// 	return fmt.Errorf("failed to rollback CometBFT state: %w", err)
+			// }
 			// rollback the multistore
+			if height == 0 {
+				return errors.New("cannot rollback to height 0")
+			}
 
 			if err := app.CommitMultiStore().RollbackToVersion(height); err != nil {
 				return fmt.Errorf("failed to rollback to version: %w", err)
 			}
 
-			fmt.Printf("Rolled back state to height %d and hash %X", height, hash)
+			fmt.Printf("Rolled back state to height %d", height)
 			return nil
 		},
 	}
 
 	cmd.Flags().String(flags.FlagHome, defaultNodeHome, "The application home directory")
 	cmd.Flags().BoolVar(&removeBlock, "hard", false, "remove last block as well as state")
+	cmd.Flags().Int64Var(&height, "height", 0, "height to rollback to")
 	return cmd
 }
